@@ -1,5 +1,5 @@
 # sharepoint.py
-# Microsoft Graph API integration for SharePoint file operations with template-based Excel generation
+# Microsoft Graph API integration for SharePoint file operations with dynamic year tab names
 
 import json
 import requests
@@ -34,7 +34,7 @@ class SharePoint:
         self.access_token = ""
         self.drive_id = ""
 
-        # Define payer mapping to rows (zero-indexed becomes 1-indexed in Excel)
+        # Define payer mapping to rows
         self.payer_row_mapping = {
             'Aetna': 5,
             'Amerigroup': 6,
@@ -58,6 +58,14 @@ class SharePoint:
         }
 
         self.authenticate_and_get_drive_id()
+
+    def get_month_sheet_name(self, year, month_number):
+        """Generate dynamic sheet name for a specific year and month"""
+        return f"{year}-{month_number}"
+
+    def get_ytd_sheet_name(self, year):
+        """Generate YTD sheet name for a specific year"""
+        return f"{year}-YTD"
 
     def authenticate_and_get_drive_id(self):
         """This method authenticates the O365 account and gets the drive id."""
@@ -272,16 +280,17 @@ class SharePoint:
             print(f"No PMT MASTER files found in {environment} folder")
             return
 
+        # Group files by year-month
         monthly_data = defaultdict(list)
         for file_path in excel_files:
             filename = file_path.name
             if filename.startswith(('2024-', '2025-', '2026-')):
-                year_month = filename[:7]
+                year_month = filename[:7]  # "2025-08"
                 monthly_data[year_month].append(file_path)
 
-        # Generate YTD summary using template
+        # Process both monthly and YTD reports
         if monthly_data:
-            self._generate_ytd_from_template(monthly_data, stats_dir)
+            self._generate_reports_from_template(monthly_data, stats_dir)
 
         print(f"Excel reports generated in '{environment}_stats' folder")
 
@@ -295,8 +304,8 @@ class SharePoint:
             pass
         return None
 
-    def _generate_ytd_from_template(self, monthly_data, stats_dir):
-        """Generate Year-to-Date Excel report using template"""
+    def _generate_reports_from_template(self, monthly_data, stats_dir):
+        """Generate both monthly and YTD Excel reports using template"""
         years = set()
         for year_month in monthly_data.keys():
             year = year_month.split('-')[0]
@@ -307,47 +316,59 @@ class SharePoint:
             if not year_months:
                 continue
 
-            print(f"Generating YTD Excel report for {year}...")
+            print(f"Generating Excel reports for {year}...")
 
-            # Check if YTD file already exists
-            ytd_file_path = stats_dir / f"{year}-YTD.xlsx"
+            # Check if file already exists
+            excel_file_path = stats_dir / f"{year}_Stats.xlsx"
             template_path = Path("Stats_template.xlsx")
 
-            if not ytd_file_path.exists():
-                # Copy template to create new YTD file
+            if not excel_file_path.exists():
+                # Copy template to create new file
                 if not template_path.exists():
                     print(f"Error: Stats_template.xlsx not found in root directory")
                     return
 
-                print(f"Creating new YTD file from template...")
-                shutil.copy2(template_path, ytd_file_path)
+                print(f"Creating new stats file from template...")
+                shutil.copy2(template_path, excel_file_path)
 
-                # Update the template with correct year
-                wb = load_workbook(ytd_file_path, keep_vba=False)
+                # Update the template with correct year for ALL tabs
+                wb = load_workbook(excel_file_path, keep_vba=False)
 
-                # Rename the worksheet tab from "YYYY-YTD" to "{year}-YTD"
-                if "YYYY-YTD" in wb.sheetnames:
-                    ws = wb["YYYY-YTD"]
-                    ws.title = f"{year}-YTD"
+                # Update all worksheet names and content
+                original_sheet_names = list(wb.sheetnames)  # Make a copy to avoid modification during iteration
 
-                # Update cell A1 with the correct year (assuming it contains year reference)
-                ws = wb.active
-                if ws['A1'].value and 'YYYY' in str(ws['A1'].value):
-                    ws['A1'].value = str(ws['A1'].value).replace('YYYY', year)
+                for original_sheet_name in original_sheet_names:
+                    ws = wb[original_sheet_name]
 
-                wb.save(ytd_file_path)
+                    # Update worksheet tab name
+                    new_sheet_name = original_sheet_name.replace('YYYY', year)
+                    if new_sheet_name != original_sheet_name:
+                        ws.title = new_sheet_name
+                        print(f"Renamed tab: {original_sheet_name} -> {new_sheet_name}")
+
+                    # Update cell C3 which contains the year reference
+                    if ws['C3'].value and 'YYYY' in str(ws['C3'].value):
+                        ws['C3'].value = str(ws['C3'].value).replace('YYYY', year)
+                        print(f"Updated C3 in {new_sheet_name}: {ws['C3'].value}")
+
+                wb.save(excel_file_path)
                 wb.close()
-                print(f"Template copied and updated: {ytd_file_path}")
+                print(f"Template copied and updated: {excel_file_path}")
             else:
-                print(f"YTD file already exists: {ytd_file_path}")
+                print(f"Stats file already exists: {excel_file_path}")
 
-            # Collect data for all months
-            ytd_payer_stats = defaultdict(lambda: defaultdict(int))
-            ytd_amkai_counts = defaultdict(int)
-
+            # Process each month's data
             for year_month in year_months:
-                files = monthly_data[year_month]
+                year, month_number = year_month.split('-')  # "2025", "08"
+                sheet_name = self.get_month_sheet_name(year, month_number)
 
+                print(f"Processing data for {year_month} -> {sheet_name}")
+
+                # Collect data for this specific month
+                month_payer_stats = defaultdict(lambda: defaultdict(int))
+                month_amkai_counts = defaultdict(int)
+
+                files = monthly_data[year_month]
                 for file_path in files:
                     payer_name = self._extract_payer_name(file_path.name)
                     if not payer_name:
@@ -367,107 +388,127 @@ class SharePoint:
                         # Count by normalized categories (excluding Amkai)
                         normalization_counts = df_filtered[df_filtered['Normalized'] != 'Amkai']['Normalized'].value_counts()
 
-                        # Add to YTD totals
+                        # Add to month totals
+                        for category, count in normalization_counts.items():
+                            month_payer_stats[payer_name][category] += count
+
+                        # Count Amkai separately
+                        amkai_count = (df_filtered['Normalized'] == 'Amkai').sum()
+                        month_amkai_counts[payer_name] += amkai_count
+
+                    except Exception as e:
+                        print(f"Error processing {file_path.name}: {e}")
+                        continue
+
+                # Populate the monthly worksheet
+                self._populate_monthly_worksheet(excel_file_path, sheet_name, month_payer_stats, month_amkai_counts)
+
+            # Now generate YTD data by combining all months
+            ytd_payer_stats = defaultdict(lambda: defaultdict(int))
+            ytd_amkai_counts = defaultdict(int)
+
+            for year_month in year_months:
+                files = monthly_data[year_month]
+                for file_path in files:
+                    payer_name = self._extract_payer_name(file_path.name)
+                    if not payer_name:
+                        continue
+
+                    try:
+                        df = pd.read_excel(file_path)
+                        if df.empty:
+                            continue
+
+                        df['Normalized'] = df['NOTE'].apply(self._normalize_payment_note)
+                        df_filtered = df[df['Normalized'].notna()]
+                        normalization_counts = df_filtered[df_filtered['Normalized'] != 'Amkai']['Normalized'].value_counts()
+
                         for category, count in normalization_counts.items():
                             ytd_payer_stats[payer_name][category] += count
 
-                        # Count Amkai separately
                         amkai_count = (df_filtered['Normalized'] == 'Amkai').sum()
                         ytd_amkai_counts[payer_name] += amkai_count
 
                     except Exception as e:
-                        print(f"Error processing {file_path.name} for YTD: {e}")
                         continue
 
-            # Populate the Excel file
-            self._populate_ytd_excel(ytd_file_path, ytd_payer_stats, ytd_amkai_counts)
+            # Populate YTD worksheet
+            ytd_sheet_name = self.get_ytd_sheet_name(year)
+            self._populate_monthly_worksheet(excel_file_path, ytd_sheet_name, ytd_payer_stats, ytd_amkai_counts)
 
-    def _populate_ytd_excel(self, excel_path, payer_stats, amkai_counts):
-        """Populate the YTD Excel file with data while preserving formulas and formatting"""
-        print(f"Populating Excel file: {excel_path}")
+    def _populate_monthly_worksheet(self, excel_path, sheet_name, payer_stats, amkai_counts):
+        """Populate a specific worksheet with data"""
+        print(f"Populating worksheet '{sheet_name}' in {excel_path}")
 
         try:
-            # Load workbook with data_only=False to preserve formulas
             wb = load_workbook(excel_path, data_only=False, keep_vba=False)
-            ws = wb.active  # Use the first worksheet
 
-            # Populate data for each payer
+            if sheet_name not in wb.sheetnames:
+                print(f"Warning: Worksheet '{sheet_name}' not found")
+                print(f"Available worksheets: {wb.sheetnames}")
+                wb.close()
+                return
+
+            ws = wb[sheet_name]
+
+            # Populate data for each payer using correct columns: D, F, H, K
             for payer_name, stats in payer_stats.items():
                 if payer_name in self.payer_row_mapping:
                     row = self.payer_row_mapping[payer_name]
 
-                    # Only write numeric values, don't modify any cells with formulas
                     try:
-                        # Column C = Balanced
+                        # Column D = Balanced
                         balanced_count = stats.get('Balanced', 0)
-                        if ws[f'C{row}'].data_type != 'f':  # Only write if not a formula
-                            ws[f'C{row}'].value = balanced_count
+                        if ws[f'D{row}'].data_type != 'f':
+                            ws[f'D{row}'].value = balanced_count
 
-                        # Column E = Not Balanced-Expected
+                        # Column F = Not Balanced-Expected
                         not_balanced_expected_count = stats.get('Not Balanced-Expected', 0)
-                        if ws[f'E{row}'].data_type != 'f':
-                            ws[f'E{row}'].value = not_balanced_expected_count
+                        if ws[f'F{row}'].data_type != 'f':
+                            ws[f'F{row}'].value = not_balanced_expected_count
 
-                        # Column G = Not Balanced-Review
+                        # Column H = Not Balanced-Review
                         not_balanced_review_count = stats.get('Not Balanced-Review', 0)
-                        if ws[f'G{row}'].data_type != 'f':
-                            ws[f'G{row}'].value = not_balanced_review_count
+                        if ws[f'H{row}'].data_type != 'f':
+                            ws[f'H{row}'].value = not_balanced_review_count
 
-                        # Column J = Amkai
+                        # Column K = Amkai
                         amkai_count = amkai_counts.get(payer_name, 0)
-                        if ws[f'J{row}'].data_type != 'f':
-                            ws[f'J{row}'].value = amkai_count
+                        if ws[f'K{row}'].data_type != 'f':
+                            ws[f'K{row}'].value = amkai_count
 
-                        print(f"  {payer_name}: Balanced={balanced_count}, Expected={not_balanced_expected_count}, Review={not_balanced_review_count}, Amkai={amkai_count}")
+                        print(f"  {payer_name}: D{row}={balanced_count}, F{row}={not_balanced_expected_count}, H{row}={not_balanced_review_count}, K{row}={amkai_count}")
                     except Exception as e:
                         print(f"  Warning: Could not update {payer_name} - {e}")
 
-            # Handle any payers not in our mapping (set to zero)
+            # Handle any payers not in our data (set to zero)
             for payer_name, row in self.payer_row_mapping.items():
                 if payer_name not in payer_stats:
                     try:
-                        if ws[f'C{row}'].data_type != 'f':
-                            ws[f'C{row}'].value = 0
-                        if ws[f'E{row}'].data_type != 'f':
-                            ws[f'E{row}'].value = 0
-                        if ws[f'G{row}'].data_type != 'f':
-                            ws[f'G{row}'].value = 0
-                        if ws[f'J{row}'].data_type != 'f':
-                            ws[f'J{row}'].value = amkai_counts.get(payer_name, 0)
+                        if ws[f'D{row}'].data_type != 'f':
+                            ws[f'D{row}'].value = 0
+                        if ws[f'F{row}'].data_type != 'f':
+                            ws[f'F{row}'].value = 0
+                        if ws[f'H{row}'].data_type != 'f':
+                            ws[f'H{row}'].value = 0
+                        if ws[f'K{row}'].data_type != 'f':
+                            ws[f'K{row}'].value = amkai_counts.get(payer_name, 0)
                     except Exception as e:
                         print(f"  Warning: Could not zero out {payer_name} - {e}")
 
-            # Set cursor to N1 on active sheet
+            # Set cursor to N1
             try:
                 ws.sheet_view.selection[0].activeCell = "N1"
                 ws.sheet_view.selection[0].sqref = "N1"
             except:
-                pass  # Ignore cursor setting errors
-
-            # Set cursor to N1 on all sheets and make first sheet active
-            try:
-                for sheet_name in wb.sheetnames:
-                    sheet = wb[sheet_name]
-                    if hasattr(sheet, 'sheet_view') and sheet.sheet_view.selection:
-                        sheet.sheet_view.selection[0].activeCell = "N1"
-                        sheet.sheet_view.selection[0].sqref = "N1"
-            except:
-                pass  # Ignore cursor setting errors
-
-            # Make sure first sheet is active
-            try:
-                wb.active = 0
-            except:
                 pass
 
-            # Save the file with error handling and keep_vba=False
             wb.save(excel_path)
             wb.close()
-            print(f"Excel file populated and saved: {excel_path}")
+            print(f"Worksheet '{sheet_name}' populated successfully")
 
         except Exception as e:
-            print(f"Error populating Excel file: {e}")
-            print("The template file may have formatting that's incompatible with openpyxl")
+            print(f"Error populating worksheet '{sheet_name}': {e}")
             raise
 
 
@@ -485,7 +526,7 @@ def main(environment):
         print(f"\nDownloaded {len(downloaded_files)} files to '{environment}' folder")
 
         if downloaded_files:
-            print(f"\n=== GENERATING YTD STATISTICS FROM TEMPLATE ===")
+            print(f"\n=== GENERATING MONTHLY AND YTD STATISTICS FROM TEMPLATE ===")
             client.generate_monthly_stats(environment)
 
         return files
