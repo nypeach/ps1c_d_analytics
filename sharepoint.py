@@ -244,26 +244,74 @@ class SharePoint:
 
     def _normalize_payment_note(self, note):
         """Map payment notes to normalized categories"""
-        if pd.isna(note):
+        if pd.isna(note) or note == "":
             return None
 
         note = str(note).strip()
 
+        # Debug: Print what we're processing
+        print(f"DEBUG: Processing note: '{note}'")
+
         # Exclude these categories entirely
-        if note in ['Proliance Backup Timeout', 'Batch Missing in NextGen']:
+        if note in ['Proliance Backup Timeout', 'Batch Missing in NextGen'] or note == "":
             return None
 
-        # Map to normalized categories
-        if note in ['Balanced-Batch Closed', 'Balanced-Batch Not Closed', 'Balanced']:
+        # Map to normalized categories - check Remit Exceptions FIRST before Review
+        if note in ['Balanced-Batch Not Closed', 'Balanced-Batch is Closed', 'Balanced']:
+            print(f"DEBUG: '{note}' -> Balanced")
             return 'Balanced'
-        elif note in ['Not Balanced-PLAs', 'Not Balanced-Remit Exceptions', 'Not Balanced-Expected']:
-            return 'Not Balanced-Expected'
-        elif note in ['Reconciled-Post Option Grayed Out', 'Not Balanced-Review', 'Not Balanced-TA Review']:
-            return 'Not Balanced-Review'
-        elif note == 'Amkai':
+        elif note == 'Amkai Payment':
+            print(f"DEBUG: '{note}' -> Amkai")
             return 'Amkai'
+        elif 'No Match on Waystar' in note:
+            print(f"DEBUG: '{note}' -> Waystar")
+            return 'Waystar'
+        elif 'Remit Exceptions' in note:
+            print(f"DEBUG: '{note}' -> Not Balanced-Expected (via Remit Exceptions)")
+            return 'Not Balanced-Expected'
+        elif note in ['Not Balanced-PLAs', 'Not Balanced-Expected']:
+            print(f"DEBUG: '{note}' -> Not Balanced-Expected (via direct match)")
+            return 'Not Balanced-Expected'
+        elif note == 'Reconciled-Post Option Grayed Out':
+            print(f"DEBUG: '{note}' -> Not Balanced-Review (via direct match)")
+            return 'Not Balanced-Review'
+        elif 'Review' in note:
+            print(f"DEBUG: '{note}' -> Not Balanced-Review (via Review keyword)")
+            return 'Not Balanced-Review'
         else:
-            return note
+            print(f"DEBUG: '{note}' -> Not Balanced-Review (via catch-all)")
+            return 'Not Balanced-Review'
+
+    def _fix_ytd_formulas(self, excel_path, ytd_sheet_name, year):
+        """Fix YTD sheet formulas by replacing YYYY with actual year"""
+        print(f"Fixing YTD formulas in '{ytd_sheet_name}' - replacing YYYY with {year}")
+
+        try:
+            wb = load_workbook(excel_path, data_only=False, keep_vba=False)
+
+            if ytd_sheet_name not in wb.sheetnames:
+                print(f"Warning: YTD worksheet '{ytd_sheet_name}' not found")
+                wb.close()
+                return
+
+            ws = wb[ytd_sheet_name]
+
+            # Iterate through all cells and fix formulas containing YYYY
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.data_type == 'f' and cell.value and 'YYYY' in str(cell.value):
+                        old_formula = cell.value
+                        new_formula = old_formula.replace('YYYY', year)
+                        cell.value = new_formula
+                        print(f"  Fixed formula in {cell.coordinate}: {old_formula} -> {new_formula}")
+
+            wb.save(excel_path)
+            wb.close()
+            print(f"YTD formulas fixed successfully")
+
+        except Exception as e:
+            print(f"Error fixing YTD formulas: {e}")
+            raise
 
     def generate_monthly_stats(self, environment):
         """Process downloaded PMT MASTER files and generate Excel statistics reports"""
@@ -330,32 +378,26 @@ class SharePoint:
 
                 print(f"Creating new stats file from template...")
                 shutil.copy2(template_path, excel_file_path)
+                print(f"Template copied: {excel_file_path}")
 
-                # Update the template with correct year for ALL tabs
-                wb = load_workbook(excel_file_path, keep_vba=False)
+            # Open workbook and rename tabs (replace YYYY with actual year)
+            wb = load_workbook(excel_file_path, keep_vba=False)
 
-                # Update all worksheet names and content
-                original_sheet_names = list(wb.sheetnames)  # Make a copy to avoid modification during iteration
-
-                for original_sheet_name in original_sheet_names:
-                    ws = wb[original_sheet_name]
-
-                    # Update worksheet tab name
+            # Rename all worksheet tabs that contain YYYY
+            original_sheet_names = list(wb.sheetnames)
+            for original_sheet_name in original_sheet_names:
+                if 'YYYY' in original_sheet_name:
                     new_sheet_name = original_sheet_name.replace('YYYY', year)
-                    if new_sheet_name != original_sheet_name:
-                        ws.title = new_sheet_name
-                        print(f"Renamed tab: {original_sheet_name} -> {new_sheet_name}")
+                    wb[original_sheet_name].title = new_sheet_name
+                    print(f"Renamed tab: {original_sheet_name} -> {new_sheet_name}")
 
-                    # Update cell C3 which contains the year reference
-                    if ws['C3'].value and 'YYYY' in str(ws['C3'].value):
-                        ws['C3'].value = str(ws['C3'].value).replace('YYYY', year)
-                        print(f"Updated C3 in {new_sheet_name}: {ws['C3'].value}")
+            # Save the workbook with renamed tabs
+            wb.save(excel_file_path)
+            wb.close()
 
-                wb.save(excel_file_path)
-                wb.close()
-                print(f"Template copied and updated: {excel_file_path}")
-            else:
-                print(f"Stats file already exists: {excel_file_path}")
+            # Fix YTD formulas after renaming tabs
+            ytd_sheet_name = self.get_ytd_sheet_name(year)
+            self._fix_ytd_formulas(excel_file_path, ytd_sheet_name, year)
 
             # Process each month's data
             for year_month in year_months:
@@ -367,6 +409,7 @@ class SharePoint:
                 # Collect data for this specific month
                 month_payer_stats = defaultdict(lambda: defaultdict(int))
                 month_amkai_counts = defaultdict(int)
+                month_waystar_counts = defaultdict(int)
 
                 files = monthly_data[year_month]
                 for file_path in files:
@@ -385,8 +428,11 @@ class SharePoint:
                         # Remove rows where normalization returned None
                         df_filtered = df[df['Normalized'].notna()]
 
-                        # Count by normalized categories (excluding Amkai)
-                        normalization_counts = df_filtered[df_filtered['Normalized'] != 'Amkai']['Normalized'].value_counts()
+                        # Count by normalized categories (excluding Amkai and Waystar)
+                        normalization_counts = df_filtered[
+                            (df_filtered['Normalized'] != 'Amkai') &
+                            (df_filtered['Normalized'] != 'Waystar')
+                        ]['Normalized'].value_counts()
 
                         # Add to month totals
                         for category, count in normalization_counts.items():
@@ -396,16 +442,21 @@ class SharePoint:
                         amkai_count = (df_filtered['Normalized'] == 'Amkai').sum()
                         month_amkai_counts[payer_name] += amkai_count
 
+                        # Count Waystar separately
+                        waystar_count = (df_filtered['Normalized'] == 'Waystar').sum()
+                        month_waystar_counts[payer_name] += waystar_count
+
                     except Exception as e:
                         print(f"Error processing {file_path.name}: {e}")
                         continue
 
                 # Populate the monthly worksheet
-                self._populate_monthly_worksheet(excel_file_path, sheet_name, month_payer_stats, month_amkai_counts)
+                self._populate_monthly_worksheet(excel_file_path, sheet_name, month_payer_stats, month_amkai_counts, month_waystar_counts)
 
             # Now generate YTD data by combining all months
             ytd_payer_stats = defaultdict(lambda: defaultdict(int))
             ytd_amkai_counts = defaultdict(int)
+            ytd_waystar_counts = defaultdict(int)
 
             for year_month in year_months:
                 files = monthly_data[year_month]
@@ -421,7 +472,11 @@ class SharePoint:
 
                         df['Normalized'] = df['NOTE'].apply(self._normalize_payment_note)
                         df_filtered = df[df['Normalized'].notna()]
-                        normalization_counts = df_filtered[df_filtered['Normalized'] != 'Amkai']['Normalized'].value_counts()
+
+                        normalization_counts = df_filtered[
+                            (df_filtered['Normalized'] != 'Amkai') &
+                            (df_filtered['Normalized'] != 'Waystar')
+                        ]['Normalized'].value_counts()
 
                         for category, count in normalization_counts.items():
                             ytd_payer_stats[payer_name][category] += count
@@ -429,14 +484,17 @@ class SharePoint:
                         amkai_count = (df_filtered['Normalized'] == 'Amkai').sum()
                         ytd_amkai_counts[payer_name] += amkai_count
 
+                        waystar_count = (df_filtered['Normalized'] == 'Waystar').sum()
+                        ytd_waystar_counts[payer_name] += waystar_count
+
                     except Exception as e:
                         continue
 
             # Populate YTD worksheet
             ytd_sheet_name = self.get_ytd_sheet_name(year)
-            self._populate_monthly_worksheet(excel_file_path, ytd_sheet_name, ytd_payer_stats, ytd_amkai_counts)
+            self._populate_monthly_worksheet(excel_file_path, ytd_sheet_name, ytd_payer_stats, ytd_amkai_counts, ytd_waystar_counts)
 
-    def _populate_monthly_worksheet(self, excel_path, sheet_name, payer_stats, amkai_counts):
+    def _populate_monthly_worksheet(self, excel_path, sheet_name, payer_stats, amkai_counts, waystar_counts):
         """Populate a specific worksheet with data"""
         print(f"Populating worksheet '{sheet_name}' in {excel_path}")
 
@@ -451,7 +509,7 @@ class SharePoint:
 
             ws = wb[sheet_name]
 
-            # Populate data for each payer using correct columns: D, F, H, K
+            # Populate data for each payer using correct columns: D, F, H, K, M
             for payer_name, stats in payer_stats.items():
                 if payer_name in self.payer_row_mapping:
                     row = self.payer_row_mapping[payer_name]
@@ -459,25 +517,25 @@ class SharePoint:
                     try:
                         # Column D = Balanced
                         balanced_count = stats.get('Balanced', 0)
-                        if ws[f'D{row}'].data_type != 'f':
-                            ws[f'D{row}'].value = balanced_count
+                        ws[f'D{row}'].value = balanced_count
 
                         # Column F = Not Balanced-Expected
                         not_balanced_expected_count = stats.get('Not Balanced-Expected', 0)
-                        if ws[f'F{row}'].data_type != 'f':
-                            ws[f'F{row}'].value = not_balanced_expected_count
+                        ws[f'F{row}'].value = not_balanced_expected_count
 
                         # Column H = Not Balanced-Review
                         not_balanced_review_count = stats.get('Not Balanced-Review', 0)
-                        if ws[f'H{row}'].data_type != 'f':
-                            ws[f'H{row}'].value = not_balanced_review_count
+                        ws[f'H{row}'].value = not_balanced_review_count
 
                         # Column K = Amkai
                         amkai_count = amkai_counts.get(payer_name, 0)
-                        if ws[f'K{row}'].data_type != 'f':
-                            ws[f'K{row}'].value = amkai_count
+                        ws[f'K{row}'].value = amkai_count
 
-                        print(f"  {payer_name}: D{row}={balanced_count}, F{row}={not_balanced_expected_count}, H{row}={not_balanced_review_count}, K{row}={amkai_count}")
+                        # Column M = Waystar
+                        waystar_count = waystar_counts.get(payer_name, 0)
+                        ws[f'M{row}'].value = waystar_count
+
+                        print(f"  {payer_name}: D{row}={balanced_count}, F{row}={not_balanced_expected_count}, H{row}={not_balanced_review_count}, K{row}={amkai_count}, M{row}={waystar_count}")
                     except Exception as e:
                         print(f"  Warning: Could not update {payer_name} - {e}")
 
@@ -485,14 +543,11 @@ class SharePoint:
             for payer_name, row in self.payer_row_mapping.items():
                 if payer_name not in payer_stats:
                     try:
-                        if ws[f'D{row}'].data_type != 'f':
-                            ws[f'D{row}'].value = 0
-                        if ws[f'F{row}'].data_type != 'f':
-                            ws[f'F{row}'].value = 0
-                        if ws[f'H{row}'].data_type != 'f':
-                            ws[f'H{row}'].value = 0
-                        if ws[f'K{row}'].data_type != 'f':
-                            ws[f'K{row}'].value = amkai_counts.get(payer_name, 0)
+                        ws[f'D{row}'].value = 0
+                        ws[f'F{row}'].value = 0
+                        ws[f'H{row}'].value = 0
+                        ws[f'K{row}'].value = amkai_counts.get(payer_name, 0)
+                        ws[f'M{row}'].value = waystar_counts.get(payer_name, 0)
                     except Exception as e:
                         print(f"  Warning: Could not zero out {payer_name} - {e}")
 
