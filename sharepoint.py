@@ -323,7 +323,7 @@ class SharePoint:
                 shutil.copy2(template_path, ytd_file_path)
 
                 # Update the template with correct year
-                wb = load_workbook(ytd_file_path)
+                wb = load_workbook(ytd_file_path, keep_vba=False)
 
                 # Rename the worksheet tab from "YYYY-YTD" to "{year}-YTD"
                 if "YYYY-YTD" in wb.sheetnames:
@@ -388,7 +388,7 @@ class SharePoint:
 
         try:
             # Load workbook with data_only=False to preserve formulas
-            wb = load_workbook(excel_path, data_only=False, keep_vba=True)
+            wb = load_workbook(excel_path, data_only=False, keep_vba=False)
             ws = wb.active  # Use the first worksheet
 
             # Populate data for each payer
@@ -460,7 +460,7 @@ class SharePoint:
             except:
                 pass
 
-            # Save the file with error handling
+            # Save the file with error handling and keep_vba=False
             wb.save(excel_path)
             wb.close()
             print(f"Excel file populated and saved: {excel_path}")
